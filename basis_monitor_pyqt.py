@@ -374,7 +374,7 @@ class ExcelUpdaterThread(QThread):
                 # 设置列宽
                 column_widths = {
                     'A': 12, 'B': 15, 'C': 12, 'D': 12, 'E': 12,
-                    'F': 12, 'G': 15, 'H': 15, 'I': 12, 'J': 15, 'K': 15
+                    'F': 12, 'G': 15, 'H': 12, 'I': 12, 'J': 15, 'K': 15, 'L': 15
                 }
                 
                 for col, width in column_widths.items():
