@@ -21,6 +21,8 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QDate
 from PyQt5.QtGui import QFont, QColor, QBrush, QIcon, QPixmap
 import threading
 import os
+import ftplib
+from io import BytesIO
 
 
 class SftpManager(object):
@@ -74,6 +76,65 @@ class SftpManager(object):
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(cls.host, cls.port, cls.user, cls.passwd)
         return client
+
+
+class WorkdayManager(object):
+    FTP_HOST = '168.yibeiinv.com'
+    FTP_PORT = 59100
+    FTP_USER = 'Scripts_Only'
+    FTP_PASS = 'only_186447'
+    WORKDAYS_PATH = '/common_config/workdays.cfg'
+
+    _workdays = None
+
+    @classmethod
+    def load_workdays(cls):
+        if cls._workdays is not None:
+            return cls._workdays
+        connect_time = 0
+        while connect_time <= 3:
+            connect_time += 1
+            try:
+                ftp = ftplib.FTP()
+                ftp.encoding = 'utf-8'
+                ftp.connect(host=cls.FTP_HOST, port=cls.FTP_PORT, timeout=10)
+                ftp.login(user=cls.FTP_USER, passwd=cls.FTP_PASS)
+                data = []
+                def handle_binary(more_data):
+                    data.append(more_data)
+                ftp.retrbinary("RETR " + cls.WORKDAYS_PATH, callback=handle_binary)
+                ftp.quit()
+                content = b''.join(data).decode('utf-8')
+                workday_strs = content.split('\r\n')
+                cls._workdays = set()
+                for s in workday_strs:
+                    s = s.strip()
+                    if len(s) == 8 and s.isdigit():
+                        try:
+                            d = datetime.datetime.strptime(s, '%Y%m%d').date()
+                            cls._workdays.add(d)
+                        except ValueError:
+                            pass
+                print(f'交易日历加载成功: {len(cls._workdays)} 个交易日, 第{connect_time}次')
+                break
+            except Exception as e:
+                time.sleep(1)
+                print(f'交易日历加载失败 第{connect_time}次: {e}')
+        if cls._workdays is None:
+            cls._workdays = set()
+        return cls._workdays
+
+    @classmethod
+    def count_workdays_between(cls, start_date, end_date):
+        if cls._workdays is None:
+            cls.load_workdays()
+        count = 0
+        current = start_date
+        while current <= end_date:
+            if current in cls._workdays:
+                count += 1
+            current += datetime.timedelta(days=1)
+        return count
 
 
 class DataFetcherThread(QThread):
@@ -357,7 +418,10 @@ class BasisMonitorWindow(QMainWindow):
         
         # 测试SFTP连接
         self.test_sftp_connection()
-        
+
+        # 加载交易日历
+        self.load_workdays()
+
         # 定时器 - 数据更新
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_data)
@@ -397,6 +461,7 @@ class BasisMonitorWindow(QMainWindow):
             '合约总天数': [0]*n,
             '剩余天数': [0]*n,
             '剩余天数占比': [0.0]*n,
+            '剩余交易日': [0]*n,
             '基差(期-现)': [0.0]*n,
             '基差点比': [0.0]*n,
             '年化(交易日)': [0.0]*n,
@@ -416,6 +481,14 @@ class BasisMonitorWindow(QMainWindow):
         except Exception as e:
             self.log_message(f"❌ SFTP连接失败: {str(e)}")
             QMessageBox.warning(self, "警告", f"SFTP连接失败: {str(e)}")
+
+    def load_workdays(self):
+        """加载交易日历"""
+        try:
+            workdays = WorkdayManager.load_workdays()
+            self.log_message(f"✅ 交易日历加载成功: {len(workdays)} 个交易日")
+        except Exception as e:
+            self.log_message(f"⚠️ 交易日历加载失败: {str(e)}，将使用自然日近似计算")
     
     def create_menu(self):
         """创建菜单栏"""
@@ -619,11 +692,11 @@ class BasisMonitorWindow(QMainWindow):
     def create_data_table(self):
         """创建数据表格 - 专业级展示"""
         table = QTableWidget()
-        table.setColumnCount(11)
+        table.setColumnCount(12)
         table.setRowCount(len(self.data))
-        
-        headers = ['代码', '名称', '现价', '现货价', '合约总天数', '剩余天数', 
-                   '剩余天数占比', '基差(期-现)', '基差点比', '年化(交易日)', '年化(自然日)']
+
+        headers = ['代码', '名称', '现价', '现货价', '合约总天数', '剩余天数',
+                   '剩余天数占比', '剩余交易日', '基差(期-现)', '基差点比', '年化(交易日)', '年化(自然日)']
         table.setHorizontalHeaderLabels(headers)
         
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -799,31 +872,36 @@ class BasisMonitorWindow(QMainWindow):
         """计算基差"""
         index_type = code[:2]
         spot_price = self.spot_prices.get(index_type, 0)
-        
+
         contract_month = code[-4:]
-        
+
         if spot_price == 0 or futures_price == 0:
-            return 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
-        
+            return 0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+
         if contract_month in self.contract_dates:
             listing_date_excel = self.contract_dates[contract_month]['listing_date']
             expiry_date_excel = self.contract_dates[contract_month]['expiry_date']
         else:
-            return 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
-        
-        today_excel = self.datetime_to_excel_date(datetime.date.today())
-        
+            return 0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        today = datetime.date.today()
+        today_excel = self.datetime_to_excel_date(today)
+
         contract_total_days = expiry_date_excel - listing_date_excel
         remaining_days = expiry_date_excel - today_excel
         remaining_days = max(remaining_days, 0)
-        
+
+        expiry_date = datetime.date(1899, 12, 30) + datetime.timedelta(days=expiry_date_excel)
+        remaining_trading_days = WorkdayManager.count_workdays_between(today, expiry_date)
+        remaining_trading_days = max(remaining_trading_days, 0)
+
         remaining_ratio = remaining_days / contract_total_days if contract_total_days > 0 else 0
         basis = futures_price - spot_price
         basis_ratio = (basis / spot_price) * 10000 if spot_price > 0 else 0
-        annual_trading = (basis / remaining_days) * 252 if remaining_days > 0 else 0
+        annual_trading = (basis / remaining_trading_days) * 252 if remaining_trading_days > 0 else 0
         annual_calendar = (basis / remaining_days) * 365 if remaining_days > 0 else 0
-        
-        return contract_total_days, remaining_days, remaining_ratio, spot_price, basis, basis_ratio, annual_trading, annual_calendar
+
+        return contract_total_days, remaining_days, remaining_ratio, remaining_trading_days, spot_price, basis, basis_ratio, annual_trading, annual_calendar
     
     def get_trade_date(self):
         """获取当前应该使用的交易日期
@@ -910,12 +988,13 @@ class BasisMonitorWindow(QMainWindow):
                 self.data.loc[i, '现价'] = price
                 
                 result = self.calculate_basis(code, price)
-                contract_total_days, remaining_days, remaining_ratio, spot_price, basis, basis_ratio, annual_trading, annual_calendar = result
-                
+                contract_total_days, remaining_days, remaining_ratio, remaining_trading_days, spot_price, basis, basis_ratio, annual_trading, annual_calendar = result
+
                 self.data.loc[i, '现货价'] = spot_price
                 self.data.loc[i, '合约总天数'] = contract_total_days
                 self.data.loc[i, '剩余天数'] = remaining_days
                 self.data.loc[i, '剩余天数占比'] = round(remaining_ratio, 4)
+                self.data.loc[i, '剩余交易日'] = remaining_trading_days
                 self.data.loc[i, '基差(期-现)'] = round(basis, 2)
                 self.data.loc[i, '基差点比'] = round(basis_ratio, 2)
                 self.data.loc[i, '年化(交易日)'] = round(annual_trading, 2)
@@ -988,8 +1067,8 @@ class BasisMonitorWindow(QMainWindow):
             series = code[:2]
             bg_color = series_colors.get(series, QColor(255, 255, 255))
             
-            for j, col in enumerate(['代码', '名称', '现价', '现货价', '合约总天数', '剩余天数', 
-                                     '剩余天数占比', '基差(期-现)', '基差点比', '年化(交易日)', '年化(自然日)']):
+            for j, col in enumerate(['代码', '名称', '现价', '现货价', '合约总天数', '剩余天数',
+                                     '剩余天数占比', '剩余交易日', '基差(期-现)', '基差点比', '年化(交易日)', '年化(自然日)']):
                 value = row[col]
                 
                 if col in ['剩余天数占比']:
