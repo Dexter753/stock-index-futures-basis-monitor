@@ -4,7 +4,6 @@ import time
 import datetime
 import pyautogui
 import pandas as pd
-import numpy as np
 import warnings
 from cryptography.utils import CryptographyDeprecationWarning
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
@@ -12,12 +11,11 @@ import paramiko
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
-    QGroupBox, QGridLayout, QMessageBox, QFileDialog, QComboBox,
-    QSpinBox, QDoubleSpinBox, QTabWidget, QSplitter, QFrame,
+    QGroupBox, QGridLayout, QMessageBox, QFileDialog, QFrame,
     QStatusBar, QToolBar, QAction, QMenuBar, QMenu, QTextEdit,
-    QProgressBar, QCheckBox
+    QCheckBox
 )
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QDate
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor, QBrush, QIcon, QPixmap
 import threading
 import os
@@ -115,14 +113,23 @@ class WorkdayManager(object):
                             cls._workdays.add(d)
                         except ValueError:
                             pass
-                print(f'交易日历加载成功: {len(cls._workdays)} 个交易日, 第{connect_time}次')
                 break
             except Exception as e:
                 time.sleep(1)
-                print(f'交易日历加载失败 第{connect_time}次: {e}')
         if cls._workdays is None:
             cls._workdays = set()
         return cls._workdays
+
+    @classmethod
+    def get_workdays_count_in_year(cls, year):
+        """获取指定年份的交易日数量"""
+        if cls._workdays is None:
+            cls.load_workdays()
+        count = 0
+        for d in cls._workdays:
+            if d.year == year:
+                count += 1
+        return count
 
     @classmethod
     def count_workdays_between(cls, start_date, end_date):
@@ -142,7 +149,7 @@ class DataFetcherThread(QThread):
     error_occurred = pyqtSignal(str)
     log_message = pyqtSignal(str)
     
-    SERIES_FILTER = ['IF', 'IH', 'IC', 'IM']
+    SERIES_FILTER = ['IF', 'IC', 'IM', 'IH']
     SERIES_NAME = {'IF': '沪深300', 'IH': '上证50', 'IC': '中证500', 'IM': '中证1000'}
     INDEX_CODE_MAP = {'IF': 'sh000300', 'IH': 'sh000016', 'IC': 'sz399905', 'IM': 'sz399852'}
     
@@ -157,14 +164,15 @@ class DataFetcherThread(QThread):
         contract_dates = {}
         
         try:
-            today = time.strftime('%Y%m%d')
+            # 获取正确的交易日期（盘前回退到前一交易日）
+            today = self._get_trade_date()
             ctp_base = f'/data/ctp_data/future/{today}'
             self.log_message.emit(f"正在通过SFTP获取 {today} 数据...")
             
             client = SftpManager.open_connection()
             with client.open_sftp() as sftp:
                 # 1. 读取 name_map.csv 获取合约列表
-                contract_codes = self._fetch_contract_list(sftp, ctp_base, futures_data)
+                contract_codes = self._fetch_contract_list(sftp, ctp_base, futures_data, today)
                 
                 # 2. 读取 future_code_list.csv 获取合约日期
                 contract_dates = self._fetch_contract_dates(sftp, ctp_base)
@@ -178,8 +186,53 @@ class DataFetcherThread(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
             self.data_fetched.emit(futures_data, spot_prices, contract_codes, contract_dates)
+
+    def _get_trade_date(self):
+        """获取当前应该使用的交易日期
+        
+        交易时间：
+        - 上午：9:30 - 11:30
+        - 下午：13:00 - 15:00
+        
+        非交易时间处理：
+        - 9:30之前：使用前一个交易日的数据
+        - 15:00之后：使用当天收盘数据（文件已生成）
+        - 周末：使用上周五的数据
+        """
+        now = datetime.datetime.now()
+        current_time = now.time()
+        today = now.date()
+        
+        morning_start = datetime.time(9, 30)
+        afternoon_end = datetime.time(15, 0)
+        
+        # 检查是否是交易日（周一到周五）
+        is_trading_day = today.weekday() < 5
+        
+        if not is_trading_day:
+            # 周末，使用周五的数据
+            days_back = today.weekday() - 4
+            trade_date = today - datetime.timedelta(days=days_back)
+            self.log_message.emit(f"📅 周末，使用周五数据: {trade_date.strftime('%Y%m%d')}")
+            return trade_date.strftime('%Y%m%d')
+        
+        # 9:30之前使用前一交易日
+        if current_time < morning_start:
+            trade_date = today - datetime.timedelta(days=1)
+            # 如果前一天是周末，继续往前推
+            while trade_date.weekday() >= 5:
+                trade_date -= datetime.timedelta(days=1)
+            self.log_message.emit(f"📅 盘前(9:30前)，使用前一交易日: {trade_date.strftime('%Y%m%d')}")
+            return trade_date.strftime('%Y%m%d')
+        
+        # 15:00之后使用当天收盘数据
+        if current_time >= afternoon_end:
+            self.log_message.emit(f"📅 收盘后(15:00后)，使用当天数据: {today.strftime('%Y%m%d')}")
+        
+        # 交易时间内（9:30-15:00）使用当天数据
+        return today.strftime('%Y%m%d')
     
-    def _fetch_contract_list(self, sftp, base_path, futures_data):
+    def _fetch_contract_list(self, sftp, base_path, futures_data, today):
         contract_codes = []
         try:
             self.log_message.emit("正在读取合约映射(name_map.csv)...")
@@ -213,7 +266,6 @@ class DataFetcherThread(QThread):
         
         # 从旧路径real_tik获取期货价格（tik/目录没有IF/IH/IC/IM文件）
         if contract_codes:
-            today = time.strftime('%Y%m%d')
             try:
                 self.log_message.emit("正在从real_tik获取期货价格...")
                 df_fut = SftpManager.load_from_sftp(sftp, f'/data/Std_Data/idata/StdData/real_tik/{today}_fut.csv', type_dict={"代码": str})
@@ -453,20 +505,28 @@ class BasisMonitorWindow(QMainWindow):
             name = f"{self.SERIES_NAME.get(series, series)} {month}"
             names.append(name)
         
-        self.data = pd.DataFrame({
+        # 列顺序：代码、名称、现价、现货价、价差差值、合约总天数、剩余交易日、基差(期-现)、年化(交易日)、年化(自然日)
+        df = pd.DataFrame({
             '代码': contract_codes,
             '名称': names,
             '现价': [0.0]*n,
             '现货价': [0.0]*n,
+            '价差差值': [0.0]*n,
             '合约总天数': [0]*n,
-            '剩余天数': [0]*n,
-            '剩余天数占比': [0.0]*n,
             '剩余交易日': [0]*n,
             '基差(期-现)': [0.0]*n,
-            '基差点比': [0.0]*n,
             '年化(交易日)': [0.0]*n,
             '年化(自然日)': [0.0]*n
         })
+        
+        # 按照 IF、IC、IM、IH 的顺序排序
+        series_order = {'IF': 0, 'IC': 1, 'IM': 2, 'IH': 3}
+        df['代码'] = df['代码'].astype(str)
+        df['series_order'] = df['代码'].str[:2].map(series_order)
+        df['month'] = df['代码'].str[2:]
+        df = df.sort_values(['series_order', 'month']).drop(['series_order', 'month'], axis=1).reset_index(drop=True)
+        
+        self.data = df
         
         self.spot_prices = {'IF': 0, 'IH': 0, 'IC': 0, 'IM': 0}
     
@@ -593,44 +653,13 @@ class BasisMonitorWindow(QMainWindow):
         info_bar = self.create_info_panel()
         main_layout.addWidget(info_bar)
         
-        # 中间区域 - 表格为主
-        splitter = QSplitter(Qt.Horizontal)
-        
-        # 左侧 - 数据表格
+        # 中间区域 - 数据表格
         table_widget = QWidget()
         table_layout = QVBoxLayout(table_widget)
         table_layout.setContentsMargins(0, 0, 0, 0)
         self.table = self.create_data_table()
         table_layout.addWidget(self.table)
-        splitter.addWidget(table_widget)
-        
-        # 右侧 - 日志
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        
-        log_group = QGroupBox("运行日志")
-        log_layout = QVBoxLayout()
-        log_layout.setContentsMargins(4, 4, 4, 4)
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.document().setMaximumBlockCount(500)
-        self.log_text.setMaximumWidth(350)
-        log_layout.addWidget(self.log_text)
-        log_group.setLayout(log_layout)
-        right_layout.addWidget(log_group)
-        
-        excel_btn = QPushButton("📂 打开Excel")
-        excel_btn.clicked.connect(self.open_excel_file)
-        excel_btn.setMaximumWidth(350)
-        right_layout.addWidget(excel_btn)
-        
-        splitter.addWidget(right_widget)
-        splitter.setSizes([1400, 300])
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 1)
-        
-        main_layout.addWidget(splitter, 1)
+        main_layout.addWidget(table_widget, 1)
         
         # 底部统计面板 - 紧凑
         stats_panel = self.create_stats_panel()
@@ -692,11 +721,11 @@ class BasisMonitorWindow(QMainWindow):
     def create_data_table(self):
         """创建数据表格 - 专业级展示"""
         table = QTableWidget()
-        table.setColumnCount(12)
+        table.setColumnCount(10)
         table.setRowCount(len(self.data))
 
-        headers = ['代码', '名称', '现价', '现货价', '合约总天数', '剩余天数',
-                   '剩余天数占比', '剩余交易日', '基差(期-现)', '基差点比', '年化(交易日)', '年化(自然日)']
+        headers = ['代码', '名称', '现价', '现货价', '价差差值', '合约总天数',
+                   '剩余交易日', '基差(期-现)', '年化(交易日)', '年化(自然日)']
         table.setHorizontalHeaderLabels(headers)
         
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -869,39 +898,61 @@ class BasisMonitorWindow(QMainWindow):
         return (date - datetime.date(1899, 12, 30)).days
     
     def calculate_basis(self, code, futures_price):
-        """计算基差"""
+        """计算基差（与Excel完全一致）
+
+        Excel公式对照:
+        - 合约总天数 = 到期日 - 上市日（交易日）
+        - 剩余交易日 = 到期日 - 今天（交易日）
+        - 基差(期-现) = 期货价格 - 现货价格
+        - 年化(交易日) = (基差 / 现货价格) / 剩余交易日 * 252 * 100
+        - 年化(自然日) = (基差 / 现货价格) / 剩余天数 * 365 * 100
+        """
         index_type = code[:2]
         spot_price = self.spot_prices.get(index_type, 0)
 
         contract_month = code[-4:]
 
         if spot_price == 0 or futures_price == 0:
-            return 0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0, 0, 0.0, 0.0, 0.0
 
         if contract_month in self.contract_dates:
             listing_date_excel = self.contract_dates[contract_month]['listing_date']
             expiry_date_excel = self.contract_dates[contract_month]['expiry_date']
         else:
-            return 0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0, 0, 0.0, 0.0, 0.0
 
         today = datetime.date.today()
-        today_excel = self.datetime_to_excel_date(today)
 
-        contract_total_days = expiry_date_excel - listing_date_excel
-        remaining_days = expiry_date_excel - today_excel
-        remaining_days = max(remaining_days, 0)
-
+        # 转换日期格式
+        listing_date = datetime.date(1899, 12, 30) + datetime.timedelta(days=listing_date_excel)
         expiry_date = datetime.date(1899, 12, 30) + datetime.timedelta(days=expiry_date_excel)
+
+        # 1. 合约总天数（交易日）
+        contract_total_days = WorkdayManager.count_workdays_between(listing_date, expiry_date)
+        contract_total_days = max(contract_total_days, 1)
+
+        # 2. 剩余交易日（用于年化(交易日)计算）
         remaining_trading_days = WorkdayManager.count_workdays_between(today, expiry_date)
         remaining_trading_days = max(remaining_trading_days, 0)
 
-        remaining_ratio = remaining_days / contract_total_days if contract_total_days > 0 else 0
-        basis = futures_price - spot_price
-        basis_ratio = (basis / spot_price) * 10000 if spot_price > 0 else 0
-        annual_trading = (basis / remaining_trading_days) * 252 if remaining_trading_days > 0 else 0
-        annual_calendar = (basis / remaining_days) * 365 if remaining_days > 0 else 0
+        # 3. 剩余天数（自然日，用于年化(自然日)计算）
+        remaining_days = (expiry_date - today).days
+        remaining_days = max(remaining_days, 0)
 
-        return contract_total_days, remaining_days, remaining_ratio, remaining_trading_days, spot_price, basis, basis_ratio, annual_trading, annual_calendar
+        # 4. 基差
+        basis = futures_price - spot_price
+
+        # 5. 年化(交易日) = (基差/现货) / 剩余交易日 * 252 * 100
+        annual_trading = 0
+        if remaining_trading_days > 0 and spot_price > 0:
+            annual_trading = (basis / spot_price) / remaining_trading_days * 252 * 100
+
+        # 6. 年化(自然日) = (基差/现货) / 剩余天数 * 365 * 100
+        annual_calendar = 0
+        if remaining_days > 0 and spot_price > 0:
+            annual_calendar = (basis / spot_price) / remaining_days * 365 * 100
+
+        return contract_total_days, remaining_trading_days, remaining_days, basis, annual_trading, annual_calendar
     
     def get_trade_date(self):
         """获取当前应该使用的交易日期
@@ -988,18 +1039,18 @@ class BasisMonitorWindow(QMainWindow):
                 self.data.loc[i, '现价'] = price
                 
                 result = self.calculate_basis(code, price)
-                contract_total_days, remaining_days, remaining_ratio, remaining_trading_days, spot_price, basis, basis_ratio, annual_trading, annual_calendar = result
+                contract_total_days, remaining_trading_days, remaining_days, basis, annual_trading, annual_calendar = result
 
-                self.data.loc[i, '现货价'] = spot_price
+                self.data.loc[i, '现货价'] = self.spot_prices.get(code[:2], 0)
                 self.data.loc[i, '合约总天数'] = contract_total_days
-                self.data.loc[i, '剩余天数'] = remaining_days
-                self.data.loc[i, '剩余天数占比'] = round(remaining_ratio, 4)
                 self.data.loc[i, '剩余交易日'] = remaining_trading_days
                 self.data.loc[i, '基差(期-现)'] = round(basis, 2)
-                self.data.loc[i, '基差点比'] = round(basis_ratio, 2)
                 self.data.loc[i, '年化(交易日)'] = round(annual_trading, 2)
                 self.data.loc[i, '年化(自然日)'] = round(annual_calendar, 2)
                 success_count += 1
+        
+        # 计算价差相关列：价差差值、到期天数差值、差值/到期天数差值
+        self.calculate_spread_columns()
         
         if success_count == 0 and not need_rebuild:
             self.log_message("⚠️ 未获取到任何期货数据")
@@ -1008,6 +1059,70 @@ class BasisMonitorWindow(QMainWindow):
         else:
             self.log_message(f"成功更新 {success_count} 个合约数据")
     
+    def calculate_spread_columns(self):
+        """计算价差差值列"""
+        # 获取各个合约的现价（按合约类型分组）
+        contract_data = {'IF': {}, 'IC': {}, 'IM': {}, 'IH': {}}
+        for i, row in self.data.iterrows():
+            code = str(row['代码']).split('.')[0]
+            series = code[:2]
+            month = code[2:]
+            if series in contract_data:
+                contract_data[series][month] = {
+                    'price': row['现价']
+                }
+        
+        # 计算每个合约的价差差值
+        for i, row in self.data.iterrows():
+            code = str(row['代码']).split('.')[0]
+            series = code[:2]
+            month = code[2:]
+            
+            # 获取前一个合约月份（支持任意月份）
+            prev_month = self._get_prev_month(month, list(contract_data[series].keys()))
+            
+            if prev_month in contract_data[series]:
+                current_price = row['现价']
+                prev_price = contract_data[series][prev_month]['price']
+                
+                # 价差差值 = 前一个月份现价 - 当前月份现价
+                spread_diff = prev_price - current_price
+                self.data.loc[i, '价差差值'] = round(spread_diff, 2)
+            else:
+                # 没有前一个合约，显示空值
+                self.data.loc[i, '价差差值'] = ''
+
+    def _get_prev_month(self, month, available_months):
+        """获取前一个合约月份（支持任意月份）"""
+        # 将月份转换为数字以便比较
+        month_num = int(month)
+        # 找到比当前月份小的最大月份
+        prev_month_num = None
+        for m in available_months:
+            m_num = int(m)
+            if m_num < month_num:
+                if prev_month_num is None or m_num > prev_month_num:
+                    prev_month_num = m_num
+        if prev_month_num is not None:
+            return f"{prev_month_num:04d}"
+        return None
+
+    def _get_next_month(self, month):
+        """获取下一个合约月份（股指期货只有3、6、9、12月合约）"""
+        # 合约月份列表
+        contract_months = ['03', '06', '09', '12']
+        year = int(month[:2])
+        mon = month[2:]
+        
+        if mon in contract_months:
+            idx = contract_months.index(mon)
+            if idx < len(contract_months) - 1:
+                return f"{year:02d}{contract_months[idx + 1]}"
+            else:
+                # 12月的下一个是明年3月
+                return f"{year + 1:02d}03"
+        return None
+
     def rebuild_data_and_table(self, new_contract_codes):
         """根据新合约列表重建数据和表格"""
         self.init_data(new_contract_codes)
@@ -1067,18 +1182,17 @@ class BasisMonitorWindow(QMainWindow):
             series = code[:2]
             bg_color = series_colors.get(series, QColor(255, 255, 255))
             
-            for j, col in enumerate(['代码', '名称', '现价', '现货价', '合约总天数', '剩余天数',
-                                     '剩余天数占比', '剩余交易日', '基差(期-现)', '基差点比', '年化(交易日)', '年化(自然日)']):
+            for j, col in enumerate(['代码', '名称', '现价', '现货价', '价差差值', '合约总天数',
+                                     '剩余交易日', '基差(期-现)', '年化(交易日)', '年化(自然日)']):
                 value = row[col]
                 
-                if col in ['剩余天数占比']:
-                    text = f"{value:.2%}" if value != 0 else "0.00%"
-                elif col in ['现价', '现货价', '基差(期-现)']:
-                    text = f"{value:.2f}"
-                elif col in ['基差点比']:
-                    text = f"{value:.2f}"
+                if col in ['现价', '现货价', '基差(期-现)', '价差差值']:
+                    text = f"{value:.2f}" if value != '' else ""
                 elif col in ['年化(交易日)', '年化(自然日)']:
-                    text = f"{value:.2f}"
+                    text = f"{value:.2f}%" if value != '' else ""
+
+                elif col == '代码':
+                    text = f"{value}.CFE"
                 else:
                     text = str(int(value)) if isinstance(value, (int, float)) and value == int(value) else str(value)
                 
